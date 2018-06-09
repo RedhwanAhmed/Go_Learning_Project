@@ -2,16 +2,21 @@ package main
 
 import (
 	"crypto/md5"
+	"crypto/rand"
 	"database/sql"
+	_ "database/sql/driver"
+	"encoding/base64"
 	"fmt"
 	_ "github.com/lib/pq"
 	"html/template"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -38,10 +43,9 @@ type Cookie struct {
 type SessionManager struct {
 	cookieName  string
 	lock        sync.Mutex
-	provifer    Provider
+	provider    Provider
 	maxlifetime int64
 }
-
 
 type Provider interface {
 	SessionInit(sid string) (Session, error)
@@ -50,12 +54,16 @@ type Provider interface {
 	SessionGC(maxLifeTime int64)
 }
 
+type Session interface {
+	Set(key, value interface{}) error //set session value
+	Get(key interface{}) interface{}  //get session value
+	Delete(key interface{}) error     //delete session value
+	SessionID() string                //back current sessionID
+}
 
 type MyMux struct{}
 
-
-
-
+var provides = make(map[string]Provider)
 
 func (p *MyMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
@@ -79,13 +87,84 @@ func (p *MyMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func NewSessionManager(providerName, cookieName string, maxlifetime int64) (*SessionManager, error) {
-	provider, ok := providers[providerName]
+// Register makes a session provider available by the provided name.
+// If a Register is called twice with the same name or if the driver is nil,
+// it panics.
+func Register(name string, provider Provider) {
+	if provider == nil {
+		panic("session: Register provider is nil")
+	}
+	if _, dup := provides[name]; dup {
+		panic("session: Register called twice for provider " + name)
+	}
+	provides[name] = provider
+}
 
+func NewSessionManager(providerName, cookieName string, maxlifetime int64) (*SessionManager, error) {
+	provider, ok := provides[providerName]
 	if !ok {
 		return nil, fmt.Errorf("session: unknown provider %q (forgotten import?)", providerName)
 	}
-	return &SessionManager{provifer, cookieName: cookieName, maxlifetime: maxlifetime}, nil
+	return &SessionManager{provider: provider, cookieName: cookieName, maxlifetime: maxlifetime}, nil
+}
+
+func (manager *SessionManager) sessionId() string {
+	b := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		return ""
+	}
+	return base64.URLEncoding.EncodeToString(b)
+}
+
+func (manager *SessionManager) SessionStart(w http.ResponseWriter, r *http.Request) (session Session) {
+	manager.lock.Lock()
+	defer manager.lock.Unlock()
+	cookie, err := r.Cookie(manager.cookieName)
+	if err != nil || cookie.Value == "" {
+		sid := manager.sessionId()
+		session, _ = manager.provider.SessionInit(sid)
+		cookie := http.Cookie{Name: manager.cookieName, Value: url.QueryEscape(sid), Path: "/", HttpOnly: true, MaxAge: int(manager.maxlifetime)}
+		http.SetCookie(w, &cookie)
+	} else {
+		sid, _ := url.QueryUnescape(cookie.Value)
+		session, _ = manager.provider.SessionRead(sid)
+	}
+	return
+}
+
+func count(w http.ResponseWriter, r *http.Request) {
+	sess := globalSessions.SessionStart(w, r)
+	createtime := sess.Get("createtime")
+	if createtime == nil {
+		sess.Set("createtime", time.Now().Unix())
+	} else if (createtime.(int64) + 360) < (time.Now().Unix()) {
+		globalSessions.SessionDestroy(w, r)
+		sess = globalSessions.SessionStart(w, r)
+	}
+	ct := sess.Get("countnum")
+	if ct == nil {
+		sess.Set("countnum", 1)
+	} else {
+		sess.Set("countnum", (ct.(int) + 1))
+	}
+	t, _ := template.ParseFiles("count.gtpl")
+	w.Header().Set("Content-Type", "text/html")
+	t.Execute(w, sess.Get("countnum"))
+}
+
+// Destroy sessionid
+func (manager *SessionManager) SessionDestroy(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie(manager.cookieName)
+	if err != nil || cookie.Value == "" {
+		return
+	} else {
+		manager.lock.Lock()
+		defer manager.lock.Unlock()
+		manager.provider.SessionDestroy(cookie.Value)
+		expiration := time.Now()
+		cookie := http.Cookie{Name: manager.cookieName, Path: "/", HttpOnly: true, Expires: expiration, MaxAge: -1}
+		http.SetCookie(w, &cookie)
+	}
 }
 
 func sayHelloName(w http.ResponseWriter, r *http.Request) {
@@ -104,43 +183,67 @@ func sayHelloName(w http.ResponseWriter, r *http.Request) {
 
 }
 
+func init() {
+	go globalSessions.GC()
+}
+
+func (manager *SessionManager) GC() {
+	manager.lock.Lock()
+	defer manager.lock.Unlock()
+	manager.provider.SessionGC(manager.maxlifetime)
+	time.AfterFunc(time.Duration(manager.maxlifetime), func() { manager.GC() })
+}
+
+// func login(w http.ResponseWriter, r *http.Request) {
+// 	fmt.Println("method: ", r.Method) // get request method
+// 	if r.Method == "GET" {
+// 		crutime := time.Now().Unix()
+// 		h := md5.New()
+// 		io.WriteString(h, strconv.FormatInt(crutime, 10))
+// 		token := fmt.Sprintf("%x", h.Sum(nil))
+// 		fmt.Println("token: ", token)
+
+// 		expiration := time.Now().Add(10 * 24 * time.Hour)
+// 		cookie := http.Cookie{Name: "username", Value: "astaxie", Expires: expiration}
+// 		http.SetCookie(w, &cookie)
+
+// 		t, _ := template.ParseFiles("gtpl/login.gtpl")
+// 		err := t.Execute(w, token)
+// 		if err != nil {
+// 			fmt.Println("Error: ", err)
+// 		}
+// 	} else {
+// 		// log in request
+// 		r.ParseForm()
+// 		token := r.Form.Get("token")
+// 		if token != "" {
+// 			// check token validity
+// 			// fileUpload(w, r)
+// 			template.HTMLEscape(w, []byte("Welcome Back "+r.Form.Get("username"))) // respond to client
+// 			for _, cookie := range r.Cookies() {
+// 				fmt.Fprint(w, cookie.Name)
+// 			}
+
+// 		} else {
+// 			// give error if no token
+// 			template.HTMLEscape(w, []byte("Unauthorized login")) // respond to client
+// 		}
+// 		fmt.Println("username length:", len(r.Form["username"][0]))
+// 		fmt.Println("username:", template.HTMLEscapeString(r.Form.Get("username"))) // print in server side
+// 		fmt.Println("password:", template.HTMLEscapeString(r.Form.Get("password")))
+// 	}
+// }
+
 func login(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("method: ", r.Method) // get request method
+	sess := globalSessions.SessionStart(w, r)
+	r.ParseForm()
 	if r.Method == "GET" {
-		crutime := time.Now().Unix()
-		h := md5.New()
-		io.WriteString(h, strconv.FormatInt(crutime, 10))
-		token := fmt.Sprintf("%x", h.Sum(nil))
-		fmt.Println("token: ", token)
-
-		expiration := time.Now().Add(10 * 24 * time.Hour)
-		cookie := http.Cookie{Name: "username", Value: "astaxie", Expires: expiration}
-		http.SetCookie(w, &cookie)
-
 		t, _ := template.ParseFiles("gtpl/login.gtpl")
-		err := t.Execute(w, token)
-		if err != nil {
-			fmt.Println("Error: ", err)
-		}
+		w.Header().Set("Content-Type", "text/html")
+		t.Execute(w, sess.Get("username"))
 	} else {
-		// log in request
-		r.ParseForm()
-		token := r.Form.Get("token")
-		if token != "" {
-			// check token validity
-			// fileUpload(w, r)
-			template.HTMLEscape(w, []byte("Welcome Back "+r.Form.Get("username"))) // respond to client
-			for _, cookie := range r.Cookies() {
-				fmt.Fprint(w, cookie.Name)
-			}
-
-		} else {
-			// give error if no token
-			template.HTMLEscape(w, []byte("Unauthorized login")) // respond to client
-		}
-		fmt.Println("username length:", len(r.Form["username"][0]))
-		fmt.Println("username:", template.HTMLEscapeString(r.Form.Get("username"))) // print in server side
-		fmt.Println("password:", template.HTMLEscapeString(r.Form.Get("password")))
+		sess.Set("username", r.Form["username"])
+		http.Redirect(w, r, "/", 302)
 	}
 }
 
@@ -241,7 +344,10 @@ func dbCreateTable(tblName string) {
 	fmt.Println(res)
 }
 
+var globalSessions *session.SessionManager
+
 func main() {
+
 	mux := &MyMux{} // custom router
 	// http.HandlerFunc("/", sayHelloName)      //set Route
 	// http.HandleFunc("/login", login)
@@ -251,11 +357,12 @@ func main() {
 		log.Fatal("ListenAndServe: ", err)
 	}
 
-
 	//creating global session manager
-	var globalSessions *session.SessionManager
-    // Then, initialize the session manager
-    func init() {
-        globalSessions = NewSessionManager("memory","gosessionid",3600)
-    }
+	// var globalSessions *session.SessionManager
+	// Then, initialize the session manager
+}
+
+func init() {
+	globalSessions, _ = NewSessionManager("memory", "gosessionid", 3600)
+
 }
