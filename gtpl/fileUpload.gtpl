@@ -1,6 +1,9 @@
 <html>
 <head>
        <title>Upload file</title>
+    <style type="text/css">
+        
+    </style>
 </head>
 <body>
 <form enctype="multipart/form-data" action="http://127.0.0.1:9090/upload" method="post">

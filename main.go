@@ -21,7 +21,41 @@ const (
 	DB_NAME     = "first_test"
 )
 
+type Cookie struct {
+	Name       string
+	Value      string
+	Path       string
+	Domain     string
+	Expires    time.Time
+	RawExpires string
+	MaxAge     int
+	Secure     bool
+	HttpOnly   bool
+	Raw        string
+	Unparsed   []string // Raw text of unparsed attribute-value pairs
+}
+
+type SessionManager struct {
+	cookieName  string
+	lock        sync.Mutex
+	provifer    Provider
+	maxlifetime int64
+}
+
+
+type Provider interface {
+	SessionInit(sid string) (Session, error)
+	SessionRead(sid string) (Session, error)
+	SessionDestroy(sid string) error
+	SessionGC(maxLifeTime int64)
+}
+
+
 type MyMux struct{}
+
+
+
+
 
 func (p *MyMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
@@ -43,6 +77,15 @@ func (p *MyMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+}
+
+func NewSessionManager(providerName, cookieName string, maxlifetime int64) (*SessionManager, error) {
+	provider, ok := providers[providerName]
+
+	if !ok {
+		return nil, fmt.Errorf("session: unknown provider %q (forgotten import?)", providerName)
+	}
+	return &SessionManager{provifer, cookieName: cookieName, maxlifetime: maxlifetime}, nil
 }
 
 func sayHelloName(w http.ResponseWriter, r *http.Request) {
@@ -70,6 +113,10 @@ func login(w http.ResponseWriter, r *http.Request) {
 		token := fmt.Sprintf("%x", h.Sum(nil))
 		fmt.Println("token: ", token)
 
+		expiration := time.Now().Add(10 * 24 * time.Hour)
+		cookie := http.Cookie{Name: "username", Value: "astaxie", Expires: expiration}
+		http.SetCookie(w, &cookie)
+
 		t, _ := template.ParseFiles("gtpl/login.gtpl")
 		err := t.Execute(w, token)
 		if err != nil {
@@ -83,6 +130,10 @@ func login(w http.ResponseWriter, r *http.Request) {
 			// check token validity
 			// fileUpload(w, r)
 			template.HTMLEscape(w, []byte("Welcome Back "+r.Form.Get("username"))) // respond to client
+			for _, cookie := range r.Cookies() {
+				fmt.Fprint(w, cookie.Name)
+			}
+
 		} else {
 			// give error if no token
 			template.HTMLEscape(w, []byte("Unauthorized login")) // respond to client
@@ -199,4 +250,12 @@ func main() {
 	if err != nil {
 		log.Fatal("ListenAndServe: ", err)
 	}
+
+
+	//creating global session manager
+	var globalSessions *session.SessionManager
+    // Then, initialize the session manager
+    func init() {
+        globalSessions = NewSessionManager("memory","gosessionid",3600)
+    }
 }

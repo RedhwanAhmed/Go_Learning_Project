@@ -1,6 +1,9 @@
 <html>
     <head>
     <title>Register</title>
+    <style type="text/css">
+        
+    </style>
     </head>
     <body>
         <form action="/register" method="post">

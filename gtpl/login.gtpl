@@ -1,6 +1,9 @@
 <html>
     <head>
     <title>Login</title>
+    <style type="text/css">
+        
+    </style>
     </head>
     <body>
         <form action="/login" method="post">
